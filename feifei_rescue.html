@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<!--
+  ============================================================
+  游戏名称：营救飞飞 · 横版平台跳跃闯关小游戏
+  游玩说明：
+    · 目标：操控女生【菲菲】（粉色）穿越陷阱障碍，到达每关终点
+            解救被困的男生【飞飞】（蓝色），共 20 关。
+    · 电脑端：← → 方向键 左右移动，空格键 跳跃。
+    · 手机端：屏幕底部虚拟按钮「左」「右」「跳跃」触屏游玩。
+    · 障碍：尖刺陷阱、深坑（掉落即失败重置本关）；
+            移动平台可站上去；飞飞静止站立在终点等你。
+    · 触碰尖刺或掉落深坑 → 本关失败，点击重试重置本关。
+    · 碰到飞飞 → 过关，点击进入下一关；通关 20 关触发大结局。
+  说明：纯前端单文件，Canvas 绘制，无外部图片/音频，断网可用，
+        仅供个人学习娱乐。
+  ============================================================
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>营救飞飞 · 平台跳跃小游戏</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { width:100%; height:100%; overflow:hidden; background:#1a2340; font-family:"PingFang SC","Microsoft YaHei",sans-serif; }
+  #wrap { position:relative; width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  #stage { position:relative; width:min(100vw, calc(100vh * 16 / 9)); aspect-ratio:16/9; }
+  canvas { display:block; width:100%; height:100%; background:#aee3f7; border-radius:10px; box-shadow:0 8px 30px rgba(0,0,0,.45); }
+  /* 触屏按钮 */
+  #touch { position:absolute; left:0; bottom:0; width:100%; height:26%; display:none; z-index:5; }
+  .tbtn { position:absolute; bottom:4%; width:64px; height:64px; border-radius:50%; border:3px solid rgba(255,255,255,.7);
+          background:rgba(255,255,255,.28); color:#fff; font-size:22px; font-weight:bold; display:flex; align-items:center; justify-content:center;
+          user-select:none; touch-action:none; }
+  #btn-left { left:6%; } #btn-right { left:22%; } #btn-jump { right:6%; width:76px; height:76px; background:rgba(255,140,170,.55); font-size:20px; }
+  /* 弹窗 */
+  #overlay { position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(20,28,50,.55); z-index:10; }
+  #overlay.show { display:flex; }
+  #dialog { width:min(86vw,440px); background:#fff; border-radius:18px; padding:26px 26px 22px; text-align:center; box-shadow:0 12px 40px rgba(0,0,0,.4); }
+  #dialog h2 { font-size:24px; color:#e0537f; margin-bottom:10px; }
+  #dialog h2.blue { color:#2e75b6; }
+  #dialog p { font-size:15px; color:#555; line-height:1.6; margin-bottom:18px; }
+  #dialog .btn { display:inline-block; padding:11px 30px; margin:4px 6px; border-radius:30px; font-size:16px; font-weight:bold; cursor:pointer; border:none; color:#fff; background:#e0537f; }
+  #dialog .btn.blue { background:#2e75b6; }
+  #dialog .btn.gray { background:#9aa5b1; }
+  /* 顶部小按钮（重新开始） */
+  #restart { position:absolute; top:8px; right:10px; z-index:6; padding:6px 14px; border-radius:16px; border:none; cursor:pointer;
+             background:rgba(255,255,255,.75); color:#556; font-size:13px; font-weight:bold; }
+  @media (pointer:coarse) { #touch { display:block; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="game" width="960" height="540"></canvas>
+    <button id="restart">↻ 重来本关</button>
+    <div id="touch">
+      <div class="tbtn" id="btn-left">◀</div>
+      <div class="tbtn" id="btn-right">▶</div>
+      <div class="tbtn" id="btn-jump">跳</div>
+    </div>
+  </div>
+</div>
+
+<div id="overlay">
+  <div id="dialog">
+    <h2 id="dlg-title"></h2>
+    <p id="dlg-msg"></p>
+    <div id="dlg-btns"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ==================== 基础参数 ==================== */
+const W = 960, H = 540;          // 逻辑画布尺寸
+const GRAVITY = 0.55;            // 重力（更舒缓，跳跃更飘）
+const MOVE = 3.0;                // 水平移动速度
+const JUMP = -12.0;              // 跳跃初速度（与重力共同限制最大跳跃高度≈131px）
+const PW = 28, PH = 38;          // 玩家（菲菲）尺寸
+const GW = 26, GH = 40;          // 飞飞尺寸
+
+/* ==================== 输入状态 ==================== */
+const input = { left:false, right:false, jump:false };
+
+/* ==================== 游戏状态 ==================== */
+let state = "playing";           // playing | failed | cleared | victory
+let level = 1;                   // 当前关卡 1~20
+let player, movers, plats, spikes, goal;
+let frame = 0;
+
+/* ==================== 关卡数据（20 关） ==================== */
+/* 每关：plats 固定平台[[x,y,w,h]], movers 移动平台[[x,y,w,h,axis,range,speed]],
+   spikes 尖刺[[x,y,w,h]], start 玩家左上角[x,y], goal 飞飞左上角[x,y] */
+function L(plats, movers, spikes, start, goal){ return {plats,movers,spikes,start,goal}; }
+
+const LEVELS = [
+  /* 1~5 基础练习：平台距离短，少量尖刺 */
+  L([[0,500,960,40]],
+    [],
+    [[360,486,22,14],[540,486,22,14]],
+    [50,462],[860,460]),
+  L([[0,500,260,40],[300,500,200,40],[560,500,400,40],[390,410,120,16]],
+    [],
+    [[640,486,22,14],[662,486,22,14]],
+    [40,462],[880,460]),
+  L([[0,500,210,40],[300,500,150,40],[530,500,430,40],[250,425,80,16]],
+    [],
+    [[600,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,180,40],[700,500,260,40],[200,445,88,16],[340,395,88,16],[480,350,88,16],[600,405,88,16]],
+    [],
+    [[720,486,22,14],[800,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,240,40],[320,500,140,40],[520,500,440,40],[260,430,90,16],[430,440,70,16]],
+    [],
+    [[560,486,22,14],[620,486,22,14]],
+    [40,462],[890,460]),
+
+  /* 6~12 增加移动平台，间距变大，陷阱增多 */
+  L([[0,500,220,40],[640,500,320,40],[210,430,90,16],[360,380,90,16],[500,430,90,16]],
+    [[360,460,90,16,'x',120,1.4]],
+    [[660,486,22,14],[760,486,22,14]],
+    [40,462],[880,460]),
+  L([[0,500,200,40],[720,500,240,40],[180,440,90,16],[330,380,90,16],[490,320,90,16],[620,430,90,16]],
+    [[470,400,90,16,'x',100,1.6]],
+    [[740,486,22,14],[820,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,260,40],[360,500,600,40],[280,440,80,16]],
+    [[480,470,90,16,'x',130,1.8]],
+    [[500,486,22,14],[700,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,180,40],[760,500,200,40],[170,450,88,16],[320,400,88,16],[470,400,88,16],[620,350,88,16]],
+    [[470,420,88,16,'y',50,1.2]],
+    [[780,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,220,40],[700,500,260,40],[200,450,88,16],[340,400,88,16],[480,400,88,16]],
+    [[340,460,88,16,'x',110,1.6],[480,470,88,16,'x',90,1.3]],
+    [[720,486,22,14],[800,486,22,14]],
+    [40,462],[880,460]),
+  L([[0,500,240,40],[620,500,340,40],[230,440,88,16],[370,380,88,16],[510,380,88,16]],
+    [[510,410,88,16,'y',60,1.2]],
+    [[640,486,22,14],[760,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,200,40],[760,500,200,40],[180,450,88,16],[320,390,88,16],[460,390,88,16],[600,330,88,16]],
+    [[320,480,88,16,'x',120,1.7],[600,430,88,16,'x',100,1.5]],
+    [[780,486,22,14]],
+    [40,462],[890,460]),
+
+  /* 13~20 高难度：更多移动平台、深坑、尖刺组合 */
+  L([[0,500,180,40],[800,500,160,40],[160,450,80,16],[300,400,80,16],[440,350,80,16],[580,400,80,16],[700,450,80,16]],
+    [[300,420,80,16,'y',50,1.3],[580,420,80,16,'y',50,1.3]],
+    [[820,486,22,14]],
+    [40,462],[900,460]),
+  L([[0,500,200,40],[760,500,200,40],[180,450,86,16],[320,400,86,16],[460,350,86,16],[600,400,86,16]],
+    [[320,480,86,16,'x',110,1.7],[460,470,86,16,'x',100,1.5]],
+    [[780,486,22,14],[860,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,160,40],[820,500,140,40],[150,460,80,16],[290,410,80,16],[430,360,80,16],[570,410,80,16],[710,460,80,16]],
+    [[290,425,80,16,'y',45,1.4],[570,425,80,16,'y',45,1.4]],
+    [[840,486,22,14]],
+    [40,462],[900,460]),
+  L([[0,500,180,40],[760,500,200,40],[170,450,84,16],[310,390,84,16],[450,390,84,16],[590,330,84,16]],
+    [[310,480,84,16,'x',120,1.8],[450,470,84,16,'x',90,1.4]],
+    [[780,486,22,14],[840,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,200,40],[800,500,160,40],[180,450,80,16],[320,400,80,16],[460,350,80,16],[600,400,80,16],[720,450,80,16]],
+    [[320,420,80,16,'y',50,1.5],[600,420,80,16,'y',50,1.5]],
+    [[820,486,22,14]],
+    [40,462],[900,460]),
+  L([[0,500,160,40],[820,500,140,40],[150,460,80,16],[290,410,80,16],[430,360,80,16],[570,410,80,16],[710,460,80,16]],
+    [[290,490,80,16,'x',100,1.9],[570,490,80,16,'x',100,1.7]],
+    [[840,486,22,14]],
+    [40,462],[900,460]),
+  L([[0,500,180,40],[760,500,200,40],[170,460,80,16],[310,410,80,16],[450,360,80,16],[590,410,80,16]],
+    [[310,425,80,16,'y',45,1.6],[450,480,80,16,'x',110,1.8],[590,425,80,16,'y',45,1.5]],
+    [[780,486,22,14],[850,486,22,14]],
+    [40,462],[890,460]),
+  L([[0,500,150,40],[830,500,130,40],[140,460,76,16],[280,410,76,16],[420,360,76,16],[560,410,76,16],[700,460,76,16]],
+    [[280,490,76,16,'x',100,2.0],[420,400,76,16,'y',70,1.6],[560,490,76,16,'x',100,1.8]],
+    [[850,486,22,14]],
+    [40,462],[900,460]),
+];
+
+/* ==================== 工具 ==================== */
+const cvs = document.getElementById("game");
+const ctx = cvs.getContext("2d");
+
+function aabb(a, b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
+
+/* ==================== 关卡加载 ==================== */
+function loadLevel(n){
+  level = n;
+  const d = LEVELS[n-1];
+  plats = d.plats.map(p=>({x:p[0],y:p[1],w:p[2],h:p[3],type:"fixed",dx:0,dy:0}));
+  movers = d.movers.map(m=>({x0:m[0],y0:m[1],x:m[0],y:m[1],w:m[2],h:m[3],axis:m[4],range:m[5],speed:m[6],dir:1,dx:0,dy:0,type:"moving"}));
+  spikes = d.spikes.map(s=>({x:s[0],y:s[1],w:s[2],h:s[3]}));
+  player = { x:d.start[0], y:d.start[1], w:PW, h:PH, vx:0, vy:0, onGround:false, standingOn:null, facing:1, t:0 };
+  goal = { x:d.goal[0], y:d.goal[1], w:GW, h:GH };
+  state = "playing";
+  frame = 0;
+  hideDialog();
+}
+
+/* ==================== 输入 ==================== */
+window.addEventListener("keydown", e=>{
+  if(e.code==="ArrowLeft" || e.code==="ArrowRight" || e.code==="Space"){
+    if(["ArrowLeft","ArrowRight","Space"].includes(e.code)) e.preventDefault();
+  }
+  if(e.code==="ArrowLeft") input.left = true;
+  if(e.code==="ArrowRight") input.right = true;
+  if(e.code==="Space"){ input.jump = true; tryJump(); }
+});
+window.addEventListener("keyup", e=>{
+  if(e.code==="ArrowLeft") input.left = false;
+  if(e.code==="ArrowRight") input.right = false;
+  if(e.code==="Space") input.jump = false;
+});
+
+function bindTouch(el, key, isJump){
+  const down = e=>{ e.preventDefault(); input[key]=true; if(isJump) tryJump(); };
+  const up = e=>{ e.preventDefault(); input[key]=false; };
+  el.addEventListener("pointerdown", down);
+  el.addEventListener("pointerup", up);
+  el.addEventListener("pointerleave", up);
+  el.addEventListener("pointercancel", up);
+}
+bindTouch(document.getElementById("btn-left"), "left", false);
+bindTouch(document.getElementById("btn-right"), "right", false);
+bindTouch(document.getElementById("btn-jump"), "jump", true);
+document.getElementById("restart").addEventListener("click", ()=>loadLevel(level));
+
+/* ==================== 物理 ==================== */
+function tryJump(){
+  if(state==="playing" && player.onGround){
+    player.vy = JUMP;
+    player.onGround = false;
+    player.standingOn = null;
+  }
+}
+
+function stepMover(m){
+  if(m.axis==="x"){
+    m.x += m.speed * m.dir;
+    if(m.x > m.x0 + m.range){ m.x = m.x0 + m.range; m.dir = -1; }
+    else if(m.x < m.x0 - m.range){ m.x = m.x0 - m.range; m.dir = 1; }
+  } else {
+    m.y += m.speed * m.dir;
+    if(m.y > m.y0 + m.range){ m.y = m.y0 + m.range; m.dir = -1; }
+    else if(m.y < m.y0 - m.range){ m.y = m.y0 - m.range; m.dir = 1; }
+  }
+}
+
+function update(){
+  frame++;
+  // 移动平台步进并记录位移
+  for(const m of movers){
+    const px = m.x, py = m.y;
+    stepMover(m);
+    m.dx = m.x - px; m.dy = m.y - py;
+  }
+  // 站在移动平台上则跟随
+  if(player.standingOn){
+    player.x += player.standingOn.dx;
+    player.y += player.standingOn.dy;
+  }
+  // 水平输入
+  player.vx = 0;
+  if(input.left){ player.vx = -MOVE; player.facing = -1; }
+  if(input.right){ player.vx = MOVE; player.facing = 1; }
+  // 重力
+  player.vy += GRAVITY;
+  if(player.vy > 16) player.vy = 16;   // 限制下落速度
+
+  const solids = plats.concat(movers);
+
+  // 水平移动 + 碰撞
+  player.x += player.vx;
+  for(const p of solids){
+    if(p === player.standingOn) continue;
+    if(aabb(player, p)){
+      if(player.vx > 0) player.x = p.x - player.w;
+      else if(player.vx < 0) player.x = p.x + p.w;
+      player.vx = 0;
+    }
+  }
+  // 垂直移动 + 碰撞
+  player.y += player.vy;
+  player.onGround = false;
+  let ns = null;
+  for(const p of solids){
+    if(aabb(player, p)){
+      if(player.vy > 0){
+        player.y = p.y - player.h;
+        player.vy = 0; player.onGround = true; ns = p;
+      } else if(player.vy < 0){
+        player.y = p.y + p.h;
+        player.vy = 0;
+      }
+    }
+  }
+  player.standingOn = ns;
+  // 站在移动平台上时，直接把玩家钉在平台顶部，消除上下抖动
+  if(ns && ns.type === "moving"){
+    player.y = ns.y - player.h;
+    player.vy = 0;
+    player.onGround = true;
+  }
+
+  // 左右边界限制
+  if(player.x < 0) player.x = 0;
+  if(player.x + player.w > W) player.x = W - player.w;
+
+  // 掉落深坑
+  if(player.y > H + 60){ fail(); return; }
+
+  // 尖刺碰撞（缩小碰撞盒）
+  for(const s of spikes){
+    const box = { x:s.x+4, y:s.y+4, w:s.w-8, h:s.h-4 };
+    if(aabb(player, box)){ fail(); return; }
+  }
+
+  // 碰到飞飞 → 过关
+  if(aabb(player, goal)){
+    if(level >= 20){ showVictory(); }
+    else { showClear(); }
+  }
+}
+
+/* ==================== 绘制 ==================== */
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+function drawBackground(){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,"#8fd3f4"); g.addColorStop(1,"#dff3fb");
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  // 云朵
+  ctx.fillStyle = "rgba(255,255,255,.9)";
+  const clouds = [[120,70,1],[420,110,1.2],[700,60,0.9],[880,140,1.1]];
+  for(const c of clouds){
+    ctx.beginPath();
+    ctx.arc(c[0],c[1],26*c[2],0,7); ctx.arc(c[0]+26*c[2],c[1]-8*c[2],20*c[2],0,7);
+    ctx.arc(c[0]+50*c[2],c[1],24*c[2],0,7);
+    ctx.fill();
+  }
+  // 远处小山
+  ctx.fillStyle = "rgba(150,200,160,.5)";
+  ctx.beginPath(); ctx.moveTo(0,H); ctx.quadraticCurveTo(200,430,430,H); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(380,H); ctx.quadraticCurveTo(660,420,960,H); ctx.fill();
+}
+
+function drawPlatform(p){
+  if(p.type==="fixed"){
+    // 主体
+    const g = ctx.createLinearGradient(0,p.y,0,p.y+p.h);
+    g.addColorStop(0,"#d9a066"); g.addColorStop(1,"#b57a46");
+    ctx.fillStyle = g;
+    roundRect(p.x,p.y,p.w,p.h,6); ctx.fill();
+    // 顶部草地
+    ctx.fillStyle = "#7fc86a";
+    roundRect(p.x,p.y,p.w,10,6); ctx.fill();
+    ctx.fillStyle = "#a7e08c";
+    ctx.fillRect(p.x+2,p.y+1,p.w-4,4);
+  } else {
+    // 移动平台
+    ctx.fillStyle = "#f4a261";
+    roundRect(p.x,p.y,p.w,p.h,10); ctx.fill();
+    ctx.fillStyle = "#ffd29d";
+    roundRect(p.x+3,p.y+3,p.w-6,5,4); ctx.fill();
+  }
+}
+
+function drawSpike(s){
+  const n = Math.max(1, Math.round(s.w / 18));
+  const sw = s.w / n;
+  ctx.fillStyle = "#8d4f3a";
+  ctx.strokeStyle = "#5e3226"; ctx.lineWidth = 1.5;
+  for(let i=0;i<n;i++){
+    const x0 = s.x + i*sw;
+    ctx.beginPath();
+    ctx.moveTo(x0, s.y + s.h);
+    ctx.lineTo(x0 + sw/2, s.y);
+    ctx.lineTo(x0 + sw, s.y + s.h);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+}
+
+/* ---- Q 版女生 菲菲（粉色） ---- */
+function drawGirl(p){
+  const cx = p.x + p.w/2;
+  const foot = p.y + p.h;
+  const bob = p.onGround ? Math.sin(frame*0.3)*0 : 0;
+  const cy = p.y + 14 + bob;              // 头中心
+  const running = p.onGround && Math.abs(p.vx) > 0.1;
+  const legSwing = running ? Math.sin(frame*0.4)*5 : 0;
+
+  ctx.save();
+  ctx.translate(cx, 0);
+  if(p.facing<0) ctx.scale(-1,1);
+
+  // 双腿
+  ctx.strokeStyle = "#e8a0b8"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(-4, p.y+24); ctx.lineTo(-4+legSwing, foot);
+  ctx.moveTo(4, p.y+24); ctx.lineTo(4-legSwing, foot);
+  ctx.stroke();
+  // 鞋子
+  ctx.fillStyle = "#e0537f";
+  ctx.beginPath(); ctx.arc(-4+legSwing, foot-2, 4, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(4-legSwing, foot-2, 4, 0, 7); ctx.fill();
+
+  // 身体（粉色裙）
+  ctx.fillStyle = "#f7a8c4";
+  roundRect(-9, cy+8, 18, 15, 6); ctx.fill();
+  // 手臂
+  ctx.strokeStyle = "#f7a8c4"; ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(-9, cy+10); ctx.lineTo(-13, cy+16 + (running?Math.sin(frame*0.4)*3:0));
+  ctx.moveTo(9, cy+10); ctx.lineTo(13, cy+16 + (running?Math.sin(frame*0.4+3)*3:0));
+  ctx.stroke();
+
+  // 头
+  ctx.fillStyle = "#ffd9e6";
+  ctx.beginPath(); ctx.arc(0, cy, 13, 0, 7); ctx.fill();
+  // 头发（刘海 + 双马尾）
+  ctx.fillStyle = "#f06f9f";
+  ctx.beginPath(); ctx.arc(0, cy-1, 13, Math.PI*0.95, Math.PI*2.05); ctx.fill();
+  ctx.beginPath();
+  ctx.arc(-13, cy+4, 6, Math.PI*0.5, Math.PI*1.5); ctx.arc(-15, cy+8, 6, -Math.PI*0.6, Math.PI*0.6);
+  ctx.arc(13, cy+4, 6, Math.PI*1.5, Math.PI*0.5); ctx.arc(15, cy+8, 6, Math.PI*0.4, Math.PI*1.4);
+  ctx.fill();
+  // 蝴蝶结
+  ctx.fillStyle = "#e0537f";
+  ctx.beginPath(); ctx.arc(-13, cy-4, 4, 0, 7); ctx.arc(-18, cy-4, 4, 0, 7); ctx.fill();
+  // 眼睛
+  ctx.fillStyle = "#3a2a33";
+  ctx.beginPath(); ctx.arc(5, cy+1, 2.4, 0, 7); ctx.arc(11, cy+1, 2.4, 0, 7); ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(5.8, cy, 0.9, 0, 7); ctx.arc(11.8, cy, 0.9, 0, 7); ctx.fill();
+  // 腮红
+  ctx.fillStyle = "rgba(255,120,150,.6)";
+  ctx.beginPath(); ctx.arc(3, cy+5, 2.5, 0, 7); ctx.arc(13, cy+5, 2.5, 0, 7); ctx.fill();
+  // 嘴
+  ctx.strokeStyle = "#c2506e"; ctx.lineWidth = 1.4;
+  ctx.beginPath(); ctx.arc(8, cy+5, 2.5, 0.1, 1.4); ctx.stroke();
+
+  ctx.restore();
+}
+
+/* ---- Q 版男生 飞飞（蓝色，静止站立） ---- */
+function drawBoy(g){
+  const cx = g.x + g.w/2;
+  const foot = g.y + g.h;
+  const cy = g.y + 15;
+  const wave = Math.sin(frame*0.08)*0.35;
+
+  ctx.save();
+  ctx.translate(cx, 0);
+
+  // 腿
+  ctx.strokeStyle = "#5a86c8"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-4, g.y+24); ctx.lineTo(-4, foot); ctx.moveTo(4, g.y+24); ctx.lineTo(4, foot); ctx.stroke();
+  ctx.fillStyle = "#2e5f9e";
+  ctx.beginPath(); ctx.arc(-4, foot-2, 4, 0, 7); ctx.fill(); ctx.beginPath(); ctx.arc(4, foot-2, 4, 0, 7); ctx.fill();
+
+  // 身体（蓝衣）
+  ctx.fillStyle = "#5aa0e6";
+  roundRect(-9, cy+8, 18, 15, 6); ctx.fill();
+  // 手臂（一只挥手）
+  ctx.strokeStyle = "#5aa0e6"; ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(-9, cy+10); ctx.lineTo(-13, cy+16);
+  ctx.moveTo(9, cy+10); ctx.lineTo(14, cy+8 + wave*8);
+  ctx.stroke();
+  ctx.fillStyle = "#ffd9e6";
+  ctx.beginPath(); ctx.arc(14, cy+8+wave*8, 3, 0, 7); ctx.fill();
+
+  // 头
+  ctx.fillStyle = "#ffe3cf";
+  ctx.beginPath(); ctx.arc(0, cy, 13, 0, 7); ctx.fill();
+  // 头发
+  ctx.fillStyle = "#3a4a66";
+  ctx.beginPath(); ctx.arc(0, cy-1, 13, Math.PI*0.9, Math.PI*2.1); ctx.fill();
+  // 眼睛
+  ctx.fillStyle = "#20304a";
+  ctx.beginPath(); ctx.arc(-4, cy+1, 2.2, 0, 7); ctx.arc(5, cy+1, 2.2, 0, 7); ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(-3.3, cy+0.2, 0.8, 0, 7); ctx.arc(5.7, cy+0.2, 0.8, 0, 7); ctx.fill();
+  // 嘴
+  ctx.strokeStyle = "#b06a4a"; ctx.lineWidth = 1.4;
+  ctx.beginPath(); ctx.arc(0.5, cy+6, 3, 0.15, Math.PI-0.15); ctx.stroke();
+
+  ctx.restore();
+}
+
+/* ---- 终点提示 ---- */
+function drawGoalHint(){
+  const gx = goal.x + goal.w/2;
+  const gy = goal.y - 16;
+  const pop = Math.sin(frame*0.1)*3;
+  // 心形
+  ctx.save();
+  ctx.translate(gx, gy + pop);
+  ctx.fillStyle = "#ff5f8f";
+  ctx.beginPath();
+  ctx.moveTo(0,4); ctx.bezierCurveTo(-8,-4,-16,2,0,12); ctx.bezierCurveTo(16,2,8,-4,0,4);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawHUD(){
+  ctx.fillStyle = "rgba(255,255,255,.85)";
+  roundRect(12, 12, 170, 34, 17); ctx.fill();
+  ctx.fillStyle = "#2e75b6";
+  ctx.font = "bold 16px 'PingFang SC','Microsoft YaHei',sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.fillText("第 " + level + " / 20 关", 28, 30);
+  // 左侧小装饰
+  ctx.fillStyle = "#ff5f8f"; ctx.beginPath(); ctx.arc(20,30,6,0,7); ctx.fill();
+}
+
+function render(){
+  drawBackground();
+  for(const p of plats) drawPlatform(p);
+  for(const m of movers) drawPlatform(m);
+  for(const s of spikes) drawSpike(s);
+  drawGoalHint();
+  drawBoy(goal);
+  if(state !== "failed") drawGirl(player);
+  drawHUD();
+}
+
+/* ==================== 弹窗 ==================== */
+const overlay = document.getElementById("overlay");
+const dlgTitle = document.getElementById("dlg-title");
+const dlgMsg = document.getElementById("dlg-msg");
+const dlgBtns = document.getElementById("dlg-btns");
+
+function hideDialog(){ overlay.classList.remove("show"); dlgBtns.innerHTML = ""; }
+
+function fail(){
+  if(state !== "playing") return;
+  state = "failed";
+  showDialog("哎呀，营救失败了！", "菲菲碰到了陷阱，重新来过吧～", [
+    {txt:"重新尝试", cls:"", fn:()=>loadLevel(level)},
+    {txt:"回到第 1 关", cls:"gray", fn:()=>loadLevel(1)},
+  ], false);
+}
+
+function showClear(){
+  state = "cleared";
+  showDialog("本关营救飞飞成功！", "第 " + level + " 关完成，飞飞被救出来啦！", [
+    {txt: level>=20 ? "查看大结局" : "进入下一关", cls:"blue", fn:()=>{ if(level>=20) showVictory(); else loadLevel(level+1); }},
+  ], true);
+}
+
+function showVictory(){
+  state = "victory";
+  showDialog("恭喜通关全部 20 关！", "菲菲历经艰险，把飞飞从每一关都救了回来，两人终于团聚啦！🎉", [
+    {txt:"再玩一次", cls:"blue", fn:()=>loadLevel(1)},
+  ], true);
+}
+
+function showDialog(title, msg, buttons, isSuccess){
+  dlgTitle.textContent = title;
+  dlgTitle.className = isSuccess ? "blue" : "";
+  dlgMsg.textContent = msg;
+  dlgBtns.innerHTML = "";
+  for(const b of buttons){
+    const btn = document.createElement("button");
+    btn.className = "btn " + b.cls;
+    btn.textContent = b.txt;
+    btn.addEventListener("click", ()=>{ hideDialog(); b.fn(); });
+    dlgBtns.appendChild(btn);
+  }
+  overlay.classList.add("show");
+}
+
+/* ==================== 主循环 ==================== */
+function loop(){
+  if(state === "playing") update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+loadLevel(1);
+loop();
+</script>
+</body>
+</html>
